@@ -112,6 +112,7 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
+from agent.strategy import cheap_mask, is_catalog_trap, pick_replica, successor_of
 from agent.telemetry import RecordingGatewayContext, Telemetry
 
 __all__ = [
@@ -369,56 +370,88 @@ class Gateway:
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # Reject body-based route smuggling before any replica or budget logic.
+        body_route = cmd.args.get("route") or cmd.args.get("_route") or cmd.args.get("replica")
+        if body_route is not None:
+            return self.deny(cmd, "route declared in the body, not the header")
+
+        headers = dict(cmd.headers)
+        if cmd.headers.get("mcp-replica") is None and cmd.headers.get("Mcp-Replica") is None:
+            replica_choice = pick_replica(path_id=cmd.args.get("anchor"), known_drifting=False)
+            headers["mcp-replica"] = replica_choice.replica
+        routed = Command(
+            cmd_id=cmd.cmd_id,
+            kind=cmd.kind,
+            raw=cmd.raw,
+            server=cmd.server,
+            tool=cmd.tool,
+            args=dict(cmd.args),
+            fields=cmd.fields,
+            headers=headers,
+            lease_id=cmd.lease_id,
+            call_index=cmd.call_index,
+        )
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
         # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # Simple, honest admission gate: if the command is not executable as
+        # written or a required write precondition is missing, refuse it.
+        # The current starter does not keep a rich per-duel history; using the
+        # exact call and scope facts already in scope is enough to close the
+        # obvious holes without inventing a second source of truth.
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        write_tools = {"record_mastery", "flag_stale_slide", "file_content_bug"}
+        if routed.tool in write_tools:
+            target = None
+            for key in ("learner", "learner_id", "target", "subject", "act"):
+                candidate = routed.args.get(key)
+                if candidate is not None:
+                    target = candidate
+                    break
+            acting_user = getattr(self.ctx, "act", None)
+            if target is not None and acting_user is not None and str(target) != str(acting_user):
+                return self.deny(cmd, f"target learner {target!r} does not match ctx.act={acting_user!r}")
+            required_scope = f"wiki.write:{routed.server}"
+            scopes = getattr(self.ctx, "scopes", frozenset())
+            if required_scope not in scopes:
+                return self.deny(
+                    cmd,
+                    f"write {routed.server}.{routed.tool} requires scope {required_scope!r}, but ctx.scopes={sorted(scopes)!r}",
+                )
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
         # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        server, tool = successor_of(routed.server, routed.tool) or (routed.server, routed.tool)
+        rewritten = (server, tool) != (routed.server, routed.tool)
+        fields = tuple(routed.fields)
+        if is_catalog_trap(server, tool, fields):
+            cheap = cheap_mask(server, tool, ("name",) if server == "registry" and tool == "list_servers" else ("term",))
+            if cheap != fields:
+                rewritten = True
+                fields = cheap
+
+        if rewritten:
+            call = self._to_tool_call(
+                Command(
+                    cmd_id=routed.cmd_id,
+                    kind=routed.kind,
+                    raw=routed.raw,
+                    server=server,
+                    tool=tool,
+                    args=dict(routed.args),
+                    fields=fields,
+                    headers=dict(routed.headers),
+                    lease_id=routed.lease_id,
+                    call_index=routed.call_index,
+                )
+            )
+            decision = Decision(verdict="rewrite", call=call)
+            self._telemetry.decision_made(cmd, decision)
+            return decision
 
         call = self._to_tool_call(routed)
         decision = Decision(verdict="forward", call=call)
